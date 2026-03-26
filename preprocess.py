@@ -5,8 +5,8 @@ Computes climatological mean-state CRE maps (inputs) and global-mean net
 cloud feedback (targets) for the HadGEM GA8/GA9 and CESM2 PPEs.
 
 Outputs (saved to --outdir):
-  hadgem_ga8_cre.nc   -- (member, 2, lat, lon): [SW_CRE, LW_CRE] amip climatology
-  hadgem_ga8_fb.nc    -- (member,): global-mean net cloud feedback
+  hadgem_ga8_cre.nc   -- (realization, 2, lat, lon): [SW_CRE, LW_CRE] amip climatology
+  hadgem_ga8_fb.nc    -- (realization,): global-mean net cloud feedback
   hadgem_ga9_cre.nc
   hadgem_ga9_fb.nc
   cesm2_cre.nc        -- (member, 2, lat, lon): matched PD members only
@@ -23,38 +23,27 @@ CESM2 variable mapping:
   FLUT  -> rlut   (upwelling LW at TOA, all-sky)
   FLUTC -> rlutcs (upwelling LW at TOA, clear-sky)
   FSUTOA  -> rsut   (upwelling SW at TOA, all-sky)
-  FSNTOAC -> rsutcs (net SW at TOA, clear-sky) -- NOTE: this is NET not upwelling
-    => rsutcs = rsdt - FSNTOAC  but rsdt cancels in CRE difference so we need
-       SW_CRE = rsutcs - rsut = (rsdt - FSNTOAC) - FSUTOA
-       Since rsdt is the same for all-sky and clear-sky (incident solar),
-       SW_CRE = FSUTOA_clear - FSUTOA = FSNTOAC_allsky... actually:
-       FSNTOAC = rsdt - rsutcs  =>  rsutcs = rsdt - FSNTOAC
-       rsut = FSUTOA
-       SW_CRE = rsutcs - rsut = (rsdt - FSNTOAC) - FSUTOA
-       But rsdt is not in the files. However rsdt cancels if we compute delta SW_CRE.
-       For the mean state input we need absolute SW_CRE -- use rsdt from a climatology,
-       OR note that FSNTOAC = net downward clear-sky SW = rsdt - rsutcs, so:
-         SW_CRE = rsutcs - rsut = -(FSNTOAC - rsdt + FSUTOA) ... still needs rsdt.
+  FSNTOAC -> clear-sky net downward SW at TOA = rsdt - rsutcs
 
-       SIMPLEST: use CESM2 convention directly:
-         SW_CRE_cesm = FSNTOAC - (rsdt - FSUTOA) ... still needs rsdt.
+  Therefore:
+    rsutcs = rsdt - FSNTOAC
+    SW_CRE = rsutcs - rsut = (rsdt - FSNTOAC) - FSUTOA
 
-       Actually the cleanest path: FSNTOA = rsdt - FSUTOA (net all-sky SW, not in our files).
-       We have FSUTOA (all-sky upwelling) and FSNTOAC (clear-sky net = rsdt - rsutcs).
-       SW CRE = (rsdt - rsutcs) - (rsdt - rsut) = rsut - rsutcs = FSUTOA - rsutcs
-              = FSUTOA - (rsdt - FSNTOAC)
+  The mean-state SW CRE needs rsdt, which is not present in these files. The script
+  therefore stores the exact proxy
 
-       Since rsdt is not available we cannot compute absolute SW CRE from CESM2 files alone.
-       WORKAROUND: rsdt varies little across members (same forcing), so we can approximate
-       rsdt ~ mean rsdt from all members. OR, note that for DELTA SW_CRE (feedback target)
-       rsdt cancels exactly (same prescribed solar for PD and SST4K). For the INPUT (mean-state
-       SW CRE) we need rsdt.
+    FSNTOAC + FSUTOA = rsdt - SW_CRE
 
-       SET --cesm2_rsdt_file to provide a separate rsdt file, OR the script will estimate
-       rsdt from the data: rsdt = FSNTOAC + FSUTOA_clear_approx. This is not ideal.
+  which differs from SW_CRE by the nearly fixed incoming-solar offset rsdt.
 
-       FLAG: if rsdt is unavailable, SW CRE for CESM2 inputs will be set to NaN with a warning.
-       The feedback target (delta Net CRE) is always valid since rsdt cancels.
+  For the feedback target, rsdt cancels exactly:
+
+    delta SW_CRE
+      = [(rsdt - FSNTOAC_4K) - FSUTOA_4K] - [(rsdt - FSNTOAC_PD) - FSUTOA_PD]
+      = (FSNTOAC_PD - FSNTOAC_4K) + (FSUTOA_PD - FSUTOA_4K)
+
+  so the global-mean delta Net CRE target is exact for CESM2 even though the stored
+  mean-state SW channel is an rsdt-offset proxy.
 
 Usage:
   conda run -n <env_with_xarray> python preprocess.py \\
@@ -67,7 +56,6 @@ Dependencies: xarray, numpy, scipy (for area-weighted mean)
 """
 
 import argparse
-import os
 import warnings
 from pathlib import Path
 
@@ -95,6 +83,26 @@ def global_mean(da, lat_dim="latitude"):
 def time_mean(da):
     """Simple time mean (climatology over all time steps)."""
     return da.mean(dim="time")
+
+
+def sw_cre(rsutcs, rsut):
+    """Shortwave cloud radiative effect using the project sign convention."""
+    return rsutcs - rsut
+
+
+def lw_cre(rlutcs, rlut):
+    """Longwave cloud radiative effect using the project sign convention."""
+    return rlutcs - rlut
+
+
+def cesm2_sw_cre_proxy(fsntoac, fsutoa):
+    """Exact CESM2 proxy equal to rsdt - SW_CRE when rsdt is unavailable."""
+    return fsntoac + fsutoa
+
+
+def cesm2_delta_sw_cre(fsntoac_pd, fsutoa_pd, fsntoac_4k, fsutoa_4k):
+    """Exact CESM2 delta SW CRE; rsdt cancels between PD and SST4K."""
+    return (fsntoac_pd - fsntoac_4k) + (fsutoa_pd - fsutoa_4k)
 
 
 def regrid_to_target(da, target_lat, target_lon, method="bilinear"):
@@ -129,7 +137,7 @@ def load_hadgem_var(data_dir, ppe, experiment, varname):
         "rsutcs": "toa_outgoing_shortwave_flux_assuming_clear_sky",
     }
     fname = Path(data_dir) / f"{ppe}PPE_{experiment}_{varname}.nc"
-    ds = xr.open_dataset(fname, chunks={"realization": 50})
+    ds = xr.open_dataset(fname, chunks={"realization": 50}, decode_timedelta=False)
     # Find the data variable (not coordinate variables)
     data_vars = [v for v in ds.data_vars if v not in ("latitude_longitude",)]
     if len(data_vars) == 1:
@@ -164,11 +172,11 @@ def compute_hadgem_cre_and_feedback(data_dir, ppe):
 
     # Time-mean climatologies
     print(f"  Computing climatologies...")
-    sw_cre_amip = time_mean(rsutcs_amip - rsut_amip)    # (real, lat, lon)
-    lw_cre_amip = time_mean(rlutcs_amip - rlut_amip)    # (real, lat, lon)
+    sw_cre_amip = time_mean(sw_cre(rsutcs_amip, rsut_amip))  # (real, lat, lon)
+    lw_cre_amip = time_mean(lw_cre(rlutcs_amip, rlut_amip))  # (real, lat, lon)
 
-    sw_cre_fut  = time_mean(rsutcs_fut  - rsut_fut)
-    lw_cre_fut  = time_mean(rlutcs_fut  - rlut_fut)
+    sw_cre_fut  = time_mean(sw_cre(rsutcs_fut, rsut_fut))
+    lw_cre_fut  = time_mean(lw_cre(rlutcs_fut, rlut_fut))
 
     net_cre_amip = sw_cre_amip + lw_cre_amip
     net_cre_fut  = sw_cre_fut  + lw_cre_fut
@@ -246,13 +254,13 @@ def compute_cesm2_cre_and_feedback(pd_dir, sst4k_dir):
       FSNTOAC = clear-sky net downward SW = rsdt - rsutcs
 
     SW CRE = rsutcs - rsut = (rsdt - FSNTOAC) - FSUTOA
-    For delta SW CRE (feedback), rsdt cancels:
-      delta SW CRE = -delta FSNTOAC - delta FSUTOA
 
-    For mean-state SW CRE we need rsdt. We approximate:
-      rsdt ~ FSNTOAC + FSUTOA  (valid only if net upward clear-sky SW ~ 0,
-      which is not true). Instead we flag this and set sw_cre = NaN with a
-      warning, unless --cesm2_rsdt is provided.
+    For delta SW CRE (feedback), rsdt cancels exactly:
+      delta SW CRE = (FSNTOAC_PD - FSNTOAC_4K) + (FSUTOA_PD - FSUTOA_4K)
+
+    For mean-state SW CRE we do not have rsdt, so we store the exact proxy
+      FSNTOAC + FSUTOA = rsdt - SW_CRE
+    which preserves all member-to-member structure up to the shared rsdt offset.
 
     Returns:
         cre_pd   : DataArray (member, 2, lat, lon)
@@ -289,18 +297,17 @@ def compute_cesm2_cre_and_feedback(pd_dir, sst4k_dir):
         fsntoac_4k = time_mean(load_cesm2_var(sst4k_dir, "FSNTOAC", idx))
 
         # LW CRE = rlutcs - rlut = FLUTC - FLUT (>0: clouds warm)
-        lw_cre_pd  = (flutc_pd  - flut_pd).compute()
-        lw_cre_4k  = (flutc_4k  - flut_4k).compute()
+        lw_cre_pd  = lw_cre(flutc_pd, flut_pd).compute()
+        lw_cre_4k  = lw_cre(flutc_4k, flut_4k).compute()
 
         # SW CRE = rsutcs - rsut = (rsdt - FSNTOAC) - FSUTOA = rsdt - FSNTOAC - FSUTOA
         # rsdt is not in the files but is ~constant across members.
         # Proxy = FSNTOAC + FSUTOA = rsdt - SW_CRE  (offset by rsdt, same for all members;
         # cancels after zero-mean normalisation). Store proxy; users can subtract rsdt if available.
-        sw_cre_pd_proxy = (fsntoac_pd + fsutoa_pd).compute()
+        sw_cre_pd_proxy = cesm2_sw_cre_proxy(fsntoac_pd, fsutoa_pd).compute()
 
         # Delta SW CRE: rsdt cancels exactly
-        # delta SW_CRE = -(delta FSNTOAC) - (delta FSUTOA)
-        delta_sw_cre = (fsntoac_pd - fsntoac_4k) + (fsutoa_pd - fsutoa_4k)
+        delta_sw_cre = cesm2_delta_sw_cre(fsntoac_pd, fsutoa_pd, fsntoac_4k, fsutoa_4k)
         delta_sw_cre = delta_sw_cre.compute()
         delta_lw_cre = (lw_cre_4k - lw_cre_pd).compute()
         delta_net    = (delta_sw_cre + delta_lw_cre).compute()
