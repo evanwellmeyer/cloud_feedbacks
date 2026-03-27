@@ -362,18 +362,155 @@ def compute_cesm2_cre_and_feedback(pd_dir, sst4k_dir):
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CFMIP processing
+# ---------------------------------------------------------------------------
+
+# Common 2.5-degree target grid for regridding CFMIP models before concatenation.
+# HadGEM and CESM2 PPE outputs will also need regridding to this grid before
+# cross-dataset comparisons or joint training (Stage 1d).
+COMMON_LAT = np.arange(-88.75, 90.0, 2.5)   # 72 points
+COMMON_LON = np.arange(0.0,   360.0, 2.5)   # 144 points
+
+# Models present in both PD and amip-future4K (GFDL-CM4 excluded: no PD amip)
+CFMIP_MODELS = [
+    "BCC-CSM2-MR",
+    "CanESM5",
+    "CESM2",
+    "CNRM-CM6-1",
+    "E3SM-1-0",
+    "HadGEM3-GC31-LL",
+    "IPSL-CM6A-LR",
+    "MIROC6",
+    "MRI-ESM2-0",
+    "TaiESM1",
+]
+
+# Common period shared by all 10 models
+CFMIP_CLIM_SLICE = slice("1979-01", "2014-12")
+
+
+def load_cfmip_var(data_dir, model, varname):
+    """
+    Load a CFMIP variable for one model, concatenating multiple files if present.
+    File pattern: {var}_Amon_{model}_amip*_{variant}_{grid}_{dates}.nc
+    Returns DataArray with dim (time, lat, lon).
+    """
+    files = sorted(Path(data_dir).glob(f"{varname}_Amon_{model}_*.nc"))
+    if not files:
+        raise FileNotFoundError(f"No files found for {varname} {model} in {data_dir}")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=xr.SerializationWarning)
+        warnings.filterwarnings("ignore", "In a future version of xarray the default value for data_vars",
+                                category=FutureWarning)
+        ds = xr.open_mfdataset(files, combine="by_coords", data_vars="all",
+                               decode_times=xr.coders.CFDatetimeCoder(use_cftime=True))
+    da = ds[varname].sel(time=CFMIP_CLIM_SLICE)
+    if da.sizes["time"] == 0:
+        raise ValueError(f"No data in {CFMIP_CLIM_SLICE} for {varname} {model}")
+    return da
+
+
+def compute_cfmip_cre_and_feedback(pd_dir, future4k_dir, models=None):
+    """
+    Compute mean-state CRE maps and net cloud feedback for CFMIP models.
+
+    Uses the common period 1979-2014 for all models.
+    GFDL-CM4 is excluded (no PD amip run available).
+
+    Returns:
+        cre_pd   : DataArray (model, channel, lat, lon), channel = [sw_cre, lw_cre]
+        feedback : DataArray (model,) -- global-mean delta Net CRE
+    """
+    if models is None:
+        models = CFMIP_MODELS
+
+    cre_list = []
+    fb_list  = []
+
+    for model in models:
+        print(f"  {model}...")
+        rlut_pd    = time_mean(load_cfmip_var(pd_dir,       model, "rlut"))
+        rlutcs_pd  = time_mean(load_cfmip_var(pd_dir,       model, "rlutcs"))
+        rsut_pd    = time_mean(load_cfmip_var(pd_dir,       model, "rsut"))
+        rsutcs_pd  = time_mean(load_cfmip_var(pd_dir,       model, "rsutcs"))
+
+        rlut_4k    = time_mean(load_cfmip_var(future4k_dir, model, "rlut"))
+        rlutcs_4k  = time_mean(load_cfmip_var(future4k_dir, model, "rlutcs"))
+        rsut_4k    = time_mean(load_cfmip_var(future4k_dir, model, "rsut"))
+        rsutcs_4k  = time_mean(load_cfmip_var(future4k_dir, model, "rsutcs"))
+
+        sw_cre_pd = sw_cre(rsutcs_pd, rsut_pd).compute()
+        lw_cre_pd = lw_cre(rlutcs_pd, rlut_pd).compute()
+
+        delta_sw  = sw_cre(rsutcs_4k, rsut_4k)   - sw_cre_pd
+        delta_lw  = lw_cre(rlutcs_4k, rlut_4k)   - lw_cre_pd
+        delta_net = (delta_sw + delta_lw).compute()
+
+        # Rename lat/lon to common names if needed
+        rename = {}
+        if "lat" in sw_cre_pd.dims:
+            rename["lat"] = "latitude"
+        if "lon" in sw_cre_pd.dims:
+            rename["lon"] = "longitude"
+        if rename:
+            sw_cre_pd = sw_cre_pd.rename(rename)
+            lw_cre_pd = lw_cre_pd.rename(rename)
+            delta_net = delta_net.rename(rename)
+
+        fb = global_mean(delta_net, lat_dim="latitude")
+        fb_list.append(float(fb))
+
+        # Regrid to common 2.5° grid before concatenating across models
+        sw_cre_pd = regrid_to_target(sw_cre_pd, COMMON_LAT, COMMON_LON).compute()
+        lw_cre_pd = regrid_to_target(lw_cre_pd, COMMON_LAT, COMMON_LON).compute()
+
+        cre_model = xr.concat([sw_cre_pd, lw_cre_pd], dim="channel")
+        cre_list.append(cre_model)
+
+        print(f"    delta Net CRE = {float(fb):.2f} W/m2")
+
+    model_coord = xr.DataArray(models, dims="model", name="model")
+    cre_da = xr.concat(cre_list, dim=model_coord)
+    cre_da = cre_da.assign_coords(channel=["sw_cre", "lw_cre"])
+    cre_da.name = "cre"
+    cre_da.attrs["long_name"] = "Mean-state CRE (amip 1979-2014 climatology)"
+    cre_da.attrs["sw_cre_convention"] = "rsutcs - rsut (>0: clouds cool)"
+    cre_da.attrs["lw_cre_convention"] = "rlutcs - rlut (>0: clouds warm)"
+
+    fb_da = xr.DataArray(fb_list, coords={"model": models}, dims="model", name="delta_net_cre")
+    fb_da.attrs["long_name"] = "Global-mean delta Net CRE (amip-future4K minus amip, 1979-2014)"
+    fb_da.attrs["units"] = "W m-2"
+    fb_da.attrs["note"] = (
+        "Patterned +4K warming (amipFuture protocol). "
+        "Divide by 4 K to get feedback parameter in W/m2/K. "
+        "GFDL-CM4 excluded (no PD amip run)."
+    )
+
+    return cre_da, fb_da
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing and main
+# ---------------------------------------------------------------------------
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--hadgem_dir",   default="/Users/ewellmeyer/Documents/research/HadGEM/new",
+    p.add_argument("--hadgem_dir",      default="/Users/ewellmeyer/Documents/research/HadGEM/new",
                    help="Directory containing HadGEM PPE .nc files")
-    p.add_argument("--cesm2_pd_dir", default="/Users/ewellmeyer/Documents/research/CESM2/PD",
+    p.add_argument("--cesm2_pd_dir",    default="/Users/ewellmeyer/Documents/research/CESM2/PD",
                    help="CESM2 PD base directory (contains FLUT/, FLUTC/, ... subdirs)")
-    p.add_argument("--cesm2_4k_dir", default="/Users/ewellmeyer/Documents/research/CESM2/SST4K",
+    p.add_argument("--cesm2_4k_dir",    default="/Users/ewellmeyer/Documents/research/CESM2/SST4K",
                    help="CESM2 SST4K base directory")
-    p.add_argument("--outdir",       default="/Users/ewellmeyer/Documents/research/scripts/cloud_feedbacks/data",
+    p.add_argument("--cfmip_pd_dir",    default="/Users/ewellmeyer/Documents/research/AMIP/PD/cfbvars",
+                   help="CFMIP amip PD directory (flat, CMIP6-named .nc files)")
+    p.add_argument("--cfmip_4k_dir",    default="/Users/ewellmeyer/Documents/research/AMIP/future4K/cfbvars",
+                   help="CFMIP amip-future4K directory")
+    p.add_argument("--outdir",          default="/Users/ewellmeyer/Documents/research/scripts/cloud_feedbacks/data",
                    help="Output directory for preprocessed .nc files")
-    p.add_argument("--skip_hadgem",  action="store_true")
-    p.add_argument("--skip_cesm2",   action="store_true")
+    p.add_argument("--skip_hadgem",     action="store_true")
+    p.add_argument("--skip_cesm2",      action="store_true")
+    p.add_argument("--skip_cfmip",      action="store_true")
     return p.parse_args()
 
 
@@ -382,7 +519,7 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # ---- HadGEM GA8 --------------------------------------------------------
+    # ---- HadGEM GA8 & GA9 --------------------------------------------------
     if not args.skip_hadgem:
         for ppe in ["GA8", "GA9"]:
             print(f"\n=== HadGEM {ppe} ===")
@@ -413,6 +550,22 @@ def main():
         fb.to_dataset(name="delta_net_cre").to_netcdf(fb_path)
 
         print(f"  CESM2: {cre.sizes['member']} members")
+        print(f"  Feedback range: {float(fb.min()):.2f} to {float(fb.max()):.2f} W/m2")
+
+    # ---- CFMIP -------------------------------------------------------------
+    if not args.skip_cfmip:
+        print(f"\n=== CFMIP models ===")
+        cre, fb = compute_cfmip_cre_and_feedback(args.cfmip_pd_dir, args.cfmip_4k_dir)
+
+        cre_path = outdir / "cfmip_cre.nc"
+        fb_path  = outdir / "cfmip_fb.nc"
+
+        print(f"  Saving {cre_path}")
+        cre.to_netcdf(cre_path)
+        print(f"  Saving {fb_path}")
+        fb.to_dataset(name="delta_net_cre").to_netcdf(fb_path)
+
+        print(f"  Models: {list(fb.model.values)}")
         print(f"  Feedback range: {float(fb.min()):.2f} to {float(fb.max()):.2f} W/m2")
 
     print("\nDone.")
