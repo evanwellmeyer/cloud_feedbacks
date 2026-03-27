@@ -491,6 +491,56 @@ def compute_cfmip_cre_and_feedback(pd_dir, future4k_dir, models=None):
 
 
 # ---------------------------------------------------------------------------
+# CERES processing
+# ---------------------------------------------------------------------------
+
+def compute_ceres_cre(ceres_file):
+    """
+    Compute climatological mean CRE from CERES EBAF-TOA Ed4.2.1.
+
+    Uses the full available record (all time steps in the file).
+    Regrids to the common 2.5° grid to match CFMIP outputs.
+
+    Variable mapping:
+      toa_sw_all_mon  -> rsut
+      toa_sw_clr_c_mon -> rsutcs
+      toa_lw_all_mon  -> rlut
+      toa_lw_clr_c_mon -> rlutcs
+
+    Returns:
+        cre : DataArray (channel, latitude, longitude), channel = [sw_cre, lw_cre]
+    """
+    ds = xr.open_dataset(ceres_file, mask_and_scale=True)
+
+    # Compute time-mean CRE on native 1x1 grid
+    sw = time_mean(ds["toa_sw_clr_c_mon"] - ds["toa_sw_all_mon"])   # SW CRE
+    lw = time_mean(ds["toa_lw_clr_c_mon"] - ds["toa_lw_all_mon"])   # LW CRE
+
+    # Rename to common dim names
+    sw = sw.rename({"lat": "latitude", "lon": "longitude"})
+    lw = lw.rename({"lat": "latitude", "lon": "longitude"})
+
+    print(f"  SW CRE global mean: {float(sw.mean()):.1f} W/m2  (expect ~-47)")
+    print(f"  LW CRE global mean: {float(lw.mean()):.1f} W/m2  (expect ~+26)")
+    print(f"  Time period: {str(ds.time[0].values)[:10]} to {str(ds.time[-1].values)[:10]}"
+          f"  ({ds.sizes['time']} months)")
+
+    # Regrid to common 2.5° grid
+    sw = regrid_to_target(sw, COMMON_LAT, COMMON_LON).compute()
+    lw = regrid_to_target(lw, COMMON_LAT, COMMON_LON).compute()
+
+    cre = xr.concat([sw, lw], dim="channel")
+    cre = cre.assign_coords(channel=["sw_cre", "lw_cre"])
+    cre.name = "cre"
+    cre.attrs["long_name"] = "CERES EBAF-TOA Ed4.2.1 climatological mean CRE"
+    cre.attrs["sw_cre_convention"] = "toa_sw_clr_c_mon - toa_sw_all_mon (>0 impossible globally; expect ~-47 W/m2)"
+    cre.attrs["lw_cre_convention"] = "toa_lw_clr_c_mon - toa_lw_all_mon (>0: clouds warm; expect ~+26 W/m2)"
+    cre.attrs["source_file"] = str(Path(ceres_file).name)
+
+    return cre
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing and main
 # ---------------------------------------------------------------------------
 
@@ -508,9 +558,12 @@ def parse_args():
                    help="CFMIP amip-future4K directory")
     p.add_argument("--outdir",          default="/Users/ewellmeyer/Documents/research/scripts/cloud_feedbacks/data",
                    help="Output directory for preprocessed .nc files")
+    p.add_argument("--ceres_file",      default="/Users/ewellmeyer/Documents/research/CERES/CERES_EBAF-TOA_Ed4.2.1_Subset_200003-202601.nc",
+                   help="CERES EBAF-TOA Ed4.2.1 netCDF file")
     p.add_argument("--skip_hadgem",     action="store_true")
     p.add_argument("--skip_cesm2",      action="store_true")
     p.add_argument("--skip_cfmip",      action="store_true")
+    p.add_argument("--skip_ceres",      action="store_true")
     return p.parse_args()
 
 
@@ -567,6 +620,15 @@ def main():
 
         print(f"  Models: {list(fb.model.values)}")
         print(f"  Feedback range: {float(fb.min()):.2f} to {float(fb.max()):.2f} W/m2")
+
+    # ---- CERES -------------------------------------------------------------
+    if not args.skip_ceres:
+        print(f"\n=== CERES EBAF-TOA ===")
+        cre = compute_ceres_cre(args.ceres_file)
+
+        cre_path = outdir / "ceres_cre.nc"
+        print(f"  Saving {cre_path}")
+        cre.to_netcdf(cre_path)
 
     print("\nDone.")
 

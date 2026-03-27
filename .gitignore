@@ -1,3 +1,4 @@
 data/
 memory/
 __pycache__/
+.claude/
