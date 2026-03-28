@@ -39,7 +39,7 @@ class GeoPad2d(nn.Module):
 
 
 class ConvBlock(nn.Module):
-    """GeoPad → Conv2d → BatchNorm → ReLU."""
+    """GeoPad → Conv2d → BatchNorm → Mish."""
     def __init__(self, in_ch: int, out_ch: int, kernel: int = 5, pad: int = 2):
         super().__init__()
         self.geo_pad = GeoPad2d(pad)
@@ -47,7 +47,7 @@ class ConvBlock(nn.Module):
         self.bn      = nn.BatchNorm2d(out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.relu(self.bn(self.conv(self.geo_pad(x))))
+        return F.mish(self.bn(self.conv(self.geo_pad(x))))
 
 
 class CloudFeedbackCNN(nn.Module):
@@ -59,7 +59,7 @@ class CloudFeedbackCNN(nn.Module):
         ConvBlock(64 → 128, k=5)
         ConvBlock(128→ 128, k=3)   # fine-tuning
         AdaptiveAvgPool2d(1)        # global summary (area-equal weighting)
-        Linear(128 → hidden_dim) → ReLU → Dropout → Linear(hidden_dim → 1)
+        Linear(128 → hidden_dim) → Mish → Dropout → Linear(hidden_dim → 1)
 
     All spatial dimensions are preserved throughout (no strided convs or
     max-pooling) so the global average pool integrates the full resolution
@@ -75,7 +75,7 @@ class CloudFeedbackCNN(nn.Module):
         self.gap   = nn.AdaptiveAvgPool2d(1)
         self.head  = nn.Sequential(
             nn.Linear(128, hidden_dim),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
