@@ -54,36 +54,40 @@ class CloudFeedbackCNN(nn.Module):
     """
     Default architecture:
 
-        ConvBlock(2  → 32,  k=5)   # regional cloud patterns
-        ConvBlock(32 → 64,  k=5)   # broader structures
-        ConvBlock(64 → 128, k=5)
-        ConvBlock(128→ 128, k=3)   # fine-tuning
-        AdaptiveAvgPool2d(1)        # global summary (area-equal weighting)
-        Linear(128 → hidden_dim) → Mish → Dropout → Linear(hidden_dim → 1)
+        ConvBlock(2  → 32,  k=3)         # local cloud patterns  RF=3
+        MaxPool2d(2)                      # 144×192 → 72×96       stride doubles RF
+        ConvBlock(32 → 64,  k=3)         # mesoscale features     RF=7
+        MaxPool2d(2)                      # 72×96  → 36×48        stride doubles RF
+        ConvBlock(64 → 128, k=3)         # synoptic scale         RF=15
+        ConvBlock(128→ 256, k=3)         # large scale            RF=19  (~24° lat)
+        AdaptiveAvgPool2d(1)             # global summary
+        Linear(256 → hidden_dim) → Mish → Dropout → Linear(hidden_dim → 1)
 
-    All spatial dimensions are preserved throughout (no strided convs or
-    max-pooling) so the global average pool integrates the full resolution
-    feature map.
+    The two MaxPool2d layers expand the effective receptive field from ~15 px
+    (no pooling) to ~37 px (~46° latitude), large enough to capture Walker
+    circulation and Hadley cell structure.
     """
 
     def __init__(self, hidden_dim: int = 128, dropout: float = 0.2):
         super().__init__()
-        self.conv1 = ConvBlock(2,   32,  kernel=5, pad=2)
-        self.conv2 = ConvBlock(32,  64,  kernel=5, pad=2)
-        self.conv3 = ConvBlock(64,  128, kernel=5, pad=2)
-        self.conv4 = ConvBlock(128, 128, kernel=3, pad=1)
+        self.conv1 = ConvBlock(2,   32,  kernel=3, pad=1)
+        self.pool1 = nn.MaxPool2d(2)
+        self.conv2 = ConvBlock(32,  64,  kernel=3, pad=1)
+        self.pool2 = nn.MaxPool2d(2)
+        self.conv3 = ConvBlock(64,  128, kernel=3, pad=1)
+        self.conv4 = ConvBlock(128, 256, kernel=3, pad=1)
         self.gap   = nn.AdaptiveAvgPool2d(1)
         self.head  = nn.Sequential(
-            nn.Linear(128, hidden_dim),
+            nn.Linear(256, hidden_dim),
             nn.Mish(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x = self.gap(x).flatten(1)      # (batch, 128)
-        return self.head(x).squeeze(-1)  # (batch,)
+        x = self.pool1(self.conv1(x))   # (B, 32,  72,  96)
+        x = self.pool2(self.conv2(x))   # (B, 64,  36,  48)
+        x = self.conv3(x)               # (B, 128, 36,  48)
+        x = self.conv4(x)               # (B, 256, 36,  48)
+        x = self.gap(x).flatten(1)      # (B, 256)
+        return self.head(x).squeeze(-1) # (B,)
