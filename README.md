@@ -8,7 +8,7 @@ Constrain real-world cloud feedbacks using Perturbed Parameter Ensembles (PPEs) 
 
 **Input features**: Annual-mean SW CRE and LW CRE maps on the HadGEM native 144×192 grid (1.25°×1.875°).
 
-**Strategy**: Train on a large PPE (HadGEM GA8, 503 members), evaluate on a withheld PPE generation (GA9), a structurally different PPE (CESM2), and structurally diverse CMIP6 models (CFMIP). Apply to CERES observations for the real-world constraint.
+**Strategy**: Train on GA8 + GA9 pooled (~1006 members). Pooling both HadGEM PPE generations forces the model to learn relationships that hold across different parameter perturbations rather than GA8-specific spatial correlations. The primary out-of-sample benchmark is CFMIP structural generalisation (10 structurally diverse GCM families). CESM2 (LW only) is a secondary cross-model test. Apply the final model to CERES for the real-world constraint.
 
 ### CRE definitions
 ```
@@ -25,8 +25,8 @@ For CESM2, SW CRE is unavailable directly. The mean-state proxy is `FSNTOAC + FS
 
 | Dataset | Members | Forcing | Native grid | Notes |
 |---|---|---|---|---|
-| HadGEM GA8 PPE | 503 | amipFuture (+4K patterned) | 144×192 | Training set |
-| HadGEM GA9 PPE | 503 | amipFuture (+4K patterned) | 144×192 | Same-family OOS test |
+| HadGEM GA8 PPE | 503 | amipFuture (+4K patterned) | 144×192 | Training set (CNN) |
+| HadGEM GA9 PPE | 503 | amipFuture (+4K patterned) | 144×192 | Training set (CNN); OOS for ridge baseline |
 | CESM2 PPE | 262 | Uniform +4K | 192×288 | Cross-model OOS test (LW only) |
 | CFMIP | 10 models | amip + amip-future4K | 2.5° (native varies) | Structural generalization test |
 | CERES EBAF-TOA Ed4.2.1 | — | Observed | 1°→2.5° | Observational constraint |
@@ -104,9 +104,9 @@ Output (B,)              — δNetCRE in normalised units (denormalised after)
 
 **GeoPad2d**: circular padding along longitude (no date-line seam), reflection padding along latitude (natural pole boundary). All Conv2d layers use `padding=0` — GeoPad is the only padding applied.
 
-**Training**: AdamW + CosineAnnealingLR, early stopping on validation MSE (patience=25), 10-fold CV on GA8, final model trained on all GA8 with 10% held out for early stopping.
+**Training**: AdamW + CosineAnnealingLR, early stopping on validation MSE (patience=50), 10-fold CV on pooled GA8+GA9, final model trained on all GA8+GA9 with 15% held out for early stopping. Default lr=1e-3, batch_size=100.
 
-**Normalisation**: per-pixel z-score fit on GA8 ensemble mean/std, applied to all datasets including CERES.
+**Normalisation**: per-pixel z-score fit on the pooled GA8+GA9 training set, applied to all datasets including CERES.
 
 ---
 
@@ -127,7 +127,7 @@ CESM2 (both channels) is intentionally excluded from the summary — the SW prox
 
 ## Open questions / next steps
 
-- Does the CNN close the GA8→GA9 generalization gap?
-- CFMIP structural test: does the CNN generalize across GCM families?
+- Does the CNN generalise to structurally diverse GCM families (CFMIP structural R²)?
+- Does the CNN CERES constraint converge and agree with the ridge baseline?
 - Explainability: Integrated Gradients (Captum) to identify which CRE regions drive the prediction
-- CESM2: consider LW-only CNN training track for a fair cross-model comparison
+- CESM2: LW-only CNN training track for a fair cross-model comparison (SW proxy makes both-channel results unreliable)
